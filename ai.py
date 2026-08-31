@@ -3,30 +3,44 @@ import os
 import re
 from typing import Any
 
-from openai import AsyncOpenAI
 from google import genai
+from openai import AsyncOpenAI
 
-from models import Listing, SearchFilters
+from models import AIAnalysis, Listing, SearchFilters
 
 
 class AIAnalyzer:
 
     def __init__(self):
 
-        self.groq = AsyncOpenAI(
-            api_key=os.getenv(
-                "GROQ_API_KEY"
-            ),
-            base_url=(
-                "https://api.groq.com/openai/v1"
-            ),
+        groq_key = os.getenv(
+            "GROQ_API_KEY",
+            "",
         )
 
-        self.gemini = genai.Client(
-            api_key=os.getenv(
-                "GEMINI_API_KEY"
-            )
+        gemini_key = os.getenv(
+            "GEMINI_API_KEY",
+            "",
         )
+
+        self.groq = None
+
+        if groq_key:
+
+            self.groq = AsyncOpenAI(
+                api_key=groq_key,
+                base_url=(
+                    "https://api.groq.com/openai/v1"
+                ),
+            )
+
+        self.gemini = None
+
+        if gemini_key:
+
+            self.gemini = genai.Client(
+                api_key=gemini_key
+            )
 
         self.groq_model = os.getenv(
             "GROQ_MODEL",
@@ -35,42 +49,55 @@ class AIAnalyzer:
 
         self.gemini_model = os.getenv(
             "GEMINI_MODEL",
-            "gemini-3.7-flash",
+            "gemini-2.5-flash",
         )
 
     @staticmethod
-    def _prompt(
+    def build_prompt(
         listing: Listing,
         filters: SearchFilters,
     ) -> str:
 
         return f"""
-Ты — эксперт по покупке б/у iPhone.
+Ты — эксперт по покупке подержанных iPhone.
 
-Твоя задача — оценить объявление максимально
-консервативно.
+Проанализируй конкретное объявление.
 
-НИКОГДА не выдумывай характеристики,
-которых нет в объявлении.
+КРИТИЧЕСКИЕ ПРАВИЛА:
 
-Если продавец не указал ремонт —
-пиши "не указано", а не "ремонта нет".
+1. Никогда не выдумывай информацию.
+2. Если характеристика отсутствует — напиши
+   "не указано".
+3. Не утверждай, что телефон оригинальный,
+   если это не подтверждается данными.
+4. Не утверждай, что ремонта не было,
+   если продавец этого не указал.
+5. Фотографии могут использоваться только
+   для визуальной оценки.
+6. Если дефект нельзя уверенно определить,
+   обозначь его как возможный риск.
+7. Цена должна оцениваться относительно
+   параметров самого объявления.
+8. Не выдавай финансовую гарантию.
+9. Итог "ПОКУПАТЬ" означает только
+   "выглядит выгодно при проверке",
+   а не гарантию исправности.
 
-Если фотография позволяет только предположить
-дефект — обозначай это как предположение.
-
-Параметры пользователя:
+ПАРАМЕТРЫ ПОКУПАТЕЛЯ:
 
 Модели:
 {filters.models}
 
-Бюджет:
-{filters.min_price} - {filters.max_price}
+Минимальная цена:
+{filters.min_price}
+
+Максимальная цена:
+{filters.max_price}
 
 Память:
 {filters.storage}
 
-Минимальная батарея:
+Минимальный аккумулятор:
 {filters.min_battery}
 
 Состояние:
@@ -85,7 +112,12 @@ class AIAnalyzer:
 Город:
 {filters.city}
 
+МИНУСЫ/РИСКИ ОСОБЕННО ВАЖНЫ.
+
 ОБЪЯВЛЕНИЕ:
+
+ID:
+{listing.id}
 
 Название:
 {listing.title}
@@ -94,13 +126,13 @@ class AIAnalyzer:
 {listing.model}
 
 Цена:
-{listing.price}
+{listing.price} ₽
 
 Память:
 {listing.storage_gb}
 
 Аккумулятор:
-{listing.battery_percent}
+{listing.battery_percent}%
 
 Состояние:
 {listing.condition}
@@ -126,119 +158,301 @@ class AIAnalyzer:
 Комплект:
 {listing.accessories}
 
+Дата:
+{listing.posted_at}
+
 Описание:
+
 {listing.description}
 
-Верни ТОЛЬКО JSON:
+Верни ТОЛЬКО JSON следующего вида:
 
 {{
   "score": 0,
-  "tier": "S",
-  "verdict": "BUY",
+  "tier": "D",
+  "verdict": "CAUTION",
+
   "summary": "",
+
   "advantages": [],
   "risks": [],
   "checks": [],
+
   "price_score": 0,
   "condition_score": 0,
   "battery_score": 0,
   "repair_score": 0,
-  "seller_score": 0
+  "seller_score": 0,
+
+  "price_comment": "",
+  "condition_comment": "",
+  "repair_comment": ""
 }}
 
-score:
-0-100.
+Шкала:
 
-tier:
-S, A, B, C или D.
+90-100 = S
+80-89 = A
+70-79 = B
+60-69 = C
+0-59 = D
 
 verdict:
-BUY,
-GOOD,
-CAUTION,
-AVOID.
 
-S:
-90-100
+BUY
+GOOD
+CAUTION
+AVOID
 
-A:
-80-89
+Оценка должна учитывать:
 
-B:
-70-79
+- цену;
+- состояние;
+- аккумулятор;
+- ремонт;
+- экран;
+- память;
+- продавца;
+- соответствие фильтрам;
+- риски;
+- полноту информации.
 
-C:
-60-69
-
-D:
-0-59
+Если данных мало — снижай уверенность
+и добавляй это в risks/checks.
 """
 
     @staticmethod
-    def _extract_json(text: str) -> dict:
+    def extract_json(
+        text: str,
+    ) -> dict[str, Any]:
 
-        text = text.strip()
+        text = (
+            text
+            .strip()
+            .replace(
+                "\ufeff",
+                "",
+            )
+        )
 
-        if text.startswith("```"):
+        if "```" in text:
+
             text = re.sub(
-                r"^```(?:json)?",
+                r"```(?:json)?",
                 "",
                 text,
                 flags=re.I,
             )
 
-            text = re.sub(
-                r"```$",
+            text = text.replace(
+                "```",
                 "",
-                text,
             )
 
-        match = re.search(
-            r"\{.*\}",
-            text,
-            flags=re.S,
-        )
+        start = text.find("{")
+        end = text.rfind("}")
 
-        if not match:
+        if start == -1 or end == -1:
+
             raise ValueError(
-                "AI не вернул JSON"
+                "ИИ не вернул JSON"
             )
 
-        return json.loads(
-            match.group(0)
+        raw = text[
+            start:end + 1
+        ]
+
+        return json.loads(raw)
+
+    @staticmethod
+    def normalize_result(
+        data: dict[str, Any],
+    ) -> AIAnalysis:
+
+        score = int(
+            data.get("score", 0)
         )
 
-    async def analyze_with_groq(
+        score = max(
+            0,
+            min(
+                100,
+                score,
+            ),
+        )
+
+        if score >= 90:
+            tier = "S"
+        elif score >= 80:
+            tier = "A"
+        elif score >= 70:
+            tier = "B"
+        elif score >= 60:
+            tier = "C"
+        else:
+            tier = "D"
+
+        verdict = str(
+            data.get(
+                "verdict",
+                "CAUTION",
+            )
+        ).upper()
+
+        allowed_verdicts = {
+            "BUY",
+            "GOOD",
+            "CAUTION",
+            "AVOID",
+        }
+
+        if verdict not in allowed_verdicts:
+            verdict = "CAUTION"
+
+        def list_value(
+            key: str,
+        ) -> list[str]:
+
+            value = data.get(
+                key,
+                [],
+            )
+
+            if not isinstance(
+                value,
+                list,
+            ):
+                return []
+
+            return [
+                str(x)
+                for x in value
+                if x
+            ][:10]
+
+        return AIAnalysis(
+            score=score,
+            tier=tier,
+            verdict=verdict,
+
+            summary=str(
+                data.get(
+                    "summary",
+                    "",
+                )
+            )[:1500],
+
+            advantages=list_value(
+                "advantages"
+            ),
+
+            risks=list_value(
+                "risks"
+            ),
+
+            checks=list_value(
+                "checks"
+            ),
+
+            price_score=int(
+                data.get(
+                    "price_score",
+                    0,
+                )
+            ),
+
+            condition_score=int(
+                data.get(
+                    "condition_score",
+                    0,
+                )
+            ),
+
+            battery_score=int(
+                data.get(
+                    "battery_score",
+                    0,
+                )
+            ),
+
+            repair_score=int(
+                data.get(
+                    "repair_score",
+                    0,
+                )
+            ),
+
+            seller_score=int(
+                data.get(
+                    "seller_score",
+                    0,
+                )
+            ),
+
+            price_comment=str(
+                data.get(
+                    "price_comment",
+                    "",
+                )
+            ),
+
+            condition_comment=str(
+                data.get(
+                    "condition_comment",
+                    "",
+                )
+            ),
+
+            repair_comment=str(
+                data.get(
+                    "repair_comment",
+                    "",
+                )
+            ),
+        )
+
+    async def analyze_groq(
         self,
         listing: Listing,
         filters: SearchFilters,
-    ) -> dict:
+    ) -> AIAnalysis:
 
-        response = await self.groq.chat.completions.create(
-            model=self.groq_model,
+        if not self.groq:
 
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Ты эксперт по "
-                        "рынку б/у iPhone."
-                    ),
+            raise RuntimeError(
+                "GROQ_API_KEY не установлен"
+            )
+
+        response = (
+            await self.groq.chat.completions.create(
+                model=self.groq_model,
+
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Ты очень строгий "
+                            "эксперт по б/у iPhone. "
+                            "Отвечай только JSON."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": self.build_prompt(
+                            listing,
+                            filters,
+                        ),
+                    },
+                ],
+
+                temperature=0.1,
+
+                response_format={
+                    "type": "json_object"
                 },
-                {
-                    "role": "user",
-                    "content": self._prompt(
-                        listing,
-                        filters,
-                    ),
-                },
-            ],
 
-            temperature=0.15,
-
-            response_format={
-                "type": "json_object"
-            },
+                max_tokens=1800,
+            )
         )
 
         content = (
@@ -248,76 +462,122 @@ D:
             .content
         )
 
-        return self._extract_json(
+        data = self.extract_json(
             content
         )
 
-    async def analyze_with_gemini(
+        return self.normalize_result(
+            data
+        )
+
+    async def analyze_gemini(
         self,
         listing: Listing,
         filters: SearchFilters,
-    ) -> dict:
+    ) -> AIAnalysis:
+
+        if not self.gemini:
+
+            raise RuntimeError(
+                "GEMINI_API_KEY не установлен"
+            )
 
         response = (
             self.gemini.models.generate_content(
                 model=self.gemini_model,
 
-                contents=self._prompt(
+                contents=self.build_prompt(
                     listing,
                     filters,
                 ),
             )
         )
 
-        return self._extract_json(
+        if not response.text:
+
+            raise RuntimeError(
+                "Gemini вернул пустой ответ"
+            )
+
+        data = self.extract_json(
             response.text
+        )
+
+        return self.normalize_result(
+            data
         )
 
     async def analyze(
         self,
         listing: Listing,
         filters: SearchFilters,
-    ) -> dict:
+    ) -> AIAnalysis:
 
+        errors = []
+
+        # 1. Groq
         try:
 
-            return await self.analyze_with_groq(
+            result = await self.analyze_groq(
                 listing,
                 filters,
             )
 
-        except Exception as groq_error:
+            listing.ai_analysis = result
 
-            print(
-                "Groq error:",
-                groq_error,
+            return result
+
+        except Exception as error:
+
+            errors.append(
+                f"Groq: {error}"
             )
 
-            try:
+            print(
+                errors[-1]
+            )
 
-                return await self.analyze_with_gemini(
-                    listing,
-                    filters,
-                )
+        # 2. Gemini
+        try:
 
-            except Exception as gemini_error:
+            result = await self.analyze_gemini(
+                listing,
+                filters,
+            )
 
-                print(
-                    "Gemini error:",
-                    gemini_error,
-                )
+            listing.ai_analysis = result
 
-                return {
-                    "score": 0,
-                    "tier": "D",
-                    "verdict": "CAUTION",
-                    "summary": (
-                        "ИИ-анализ временно "
-                        "недоступен."
-                    ),
-                    "advantages": [],
-                    "risks": [
-                        "Не удалось выполнить AI-анализ."
-                    ],
-                    "checks": [],
-                }
+            return result
+
+        except Exception as error:
+
+            errors.append(
+                f"Gemini: {error}"
+            )
+
+            print(
+                errors[-1]
+            )
+
+        # 3. Не падаем полностью
+        fallback = AIAnalysis(
+            score=0,
+            tier="D",
+            verdict="CAUTION",
+            summary=(
+                "AI-анализ временно "
+                "недоступен."
+            ),
+            risks=[
+                "Не удалось получить "
+                "ответ от AI."
+            ],
+            checks=[
+                "Проверь объявление "
+                "вручную."
+            ],
+        )
+
+        listing.ai_analysis = fallback
+
+        return fallback
