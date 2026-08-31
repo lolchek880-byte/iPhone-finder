@@ -1,17 +1,17 @@
 import asyncio
+import html
 import os
 from dataclasses import asdict
 
-from aiogram import (
-    Bot,
-    Dispatcher,
-    F,
-)
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Message,
 )
 
@@ -19,8 +19,11 @@ from dotenv import load_dotenv
 
 from ai import AIAnalyzer
 from avito import APIAvitoProvider
-from models import SearchFilters, Listing
-from ranking import prepare_candidates
+from models import Listing, SearchFilters
+from ranking import (
+    prepare_candidates,
+    sort_by_ai,
+)
 from storage import JSONStorage
 
 
@@ -38,7 +41,6 @@ MAX_RESULTS = int(
     )
 )
 
-
 if not BOT_TOKEN:
     raise RuntimeError(
         "BOT_TOKEN не установлен"
@@ -46,12 +48,20 @@ if not BOT_TOKEN:
 
 
 bot = Bot(
-    token=BOT_TOKEN
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(
+        parse_mode=ParseMode.HTML,
+    ),
 )
 
 dp = Dispatcher()
 
-storage = JSONStorage()
+storage = JSONStorage(
+    os.getenv(
+        "DATA_DIR",
+        "data",
+    )
+)
 
 ai = AIAnalyzer()
 
@@ -59,1142 +69,59 @@ avito = APIAvitoProvider()
 
 
 # ============================================================
-# TEMP USER SEARCH STATE
+# USER STATE
 # ============================================================
 
 user_states: dict[int, dict] = {}
 
 
-# ============================================================
-# KEYBOARDS
-# ============================================================
+def get_state(
+    user_id: int,
+) -> dict:
 
-def main_keyboard():
+    if user_id not in user_states:
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+        user_states[user_id] = {
+            "filters": SearchFilters(),
+            "results": [],
+            "awaiting": None,
+        }
 
-            [
-                InlineKeyboardButton(
-                    text="🔎 Новый поиск",
-                    callback_data="new_search",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="💾 Мой поиск",
-                    callback_data="my_search",
-                ),
-
-                InlineKeyboardButton(
-                    text="⭐ Избранное",
-                    callback_data="favorites",
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="⚙️ Фильтры",
-                    callback_data="filters",
-                )
-            ],
-
-        ]
-    )
-
-
-def models_keyboard():
-
-    models = [
-        "iPhone 13",
-        "iPhone 13 Pro",
-        "iPhone 13 Pro Max",
-        "iPhone 14",
-        "iPhone 14 Pro",
-        "iPhone 14 Pro Max",
-        "iPhone 15",
-        "iPhone 15 Pro",
-        "iPhone 15 Pro Max",
-        "iPhone 16",
-        "iPhone 16 Pro",
-        "iPhone 16 Pro Max",
-    ]
-
-    rows = []
-
-    for i in range(
-        0,
-        len(models),
-        2,
-    ):
-
-        row = []
-
-        for model in models[i:i+2]:
-
-            row.append(
-                InlineKeyboardButton(
-                    text=model,
-                    callback_data=(
-                        "model:"
-                        + model
-                    ),
-                )
-            )
-
-        rows.append(row)
-
-
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="➡️ Далее",
-                callback_data="model_done",
-            )
-        ]
-    )
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=rows
-    )
-
-
-def budget_keyboard():
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-
-            [
-                InlineKeyboardButton(
-                    text="до 30 000 ₽",
-                    callback_data="budget:30000",
-                ),
-
-                InlineKeyboardButton(
-                    text="до 40 000 ₽",
-                    callback_data="budget:40000",
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="до 50 000 ₽",
-                    callback_data="budget:50000",
-                ),
-
-                InlineKeyboardButton(
-                    text="до 60 000 ₽",
-                    callback_data="budget:60000",
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="до 70 000 ₽",
-                    callback_data="budget:70000",
-                ),
-
-                InlineKeyboardButton(
-                    text="до 100 000 ₽",
-                    callback_data="budget:100000",
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="💰 Ввести самому",
-                    callback_data="budget_custom",
-                )
-            ],
-
-        ]
-    )
-
-
-def filters_keyboard():
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-
-            [
-                InlineKeyboardButton(
-                    text="💾 Память",
-                    callback_data="filter_storage",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="🔋 Аккумулятор",
-                    callback_data="filter_battery",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="🔧 Ремонт",
-                    callback_data="filter_repair",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="📱 Состояние",
-                    callback_data="filter_condition",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="🏙 Город",
-                    callback_data="filter_city",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="🔎 Начать поиск",
-                    callback_data="start_search",
-                )
-            ],
-
-        ]
-    )
-
-
-def results_keyboard(
-    listings: list[Listing],
-):
-
-    rows = []
-
-    for index, listing in enumerate(
-        listings,
-        start=1,
-    ):
-
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{index}️⃣ Подробнее",
-                    callback_data=(
-                        f"listing:{index-1}"
-                    ),
-                )
-            ]
-        )
-
-
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="🔄 Новый поиск",
-                callback_data="new_search",
-            )
-        ]
-    )
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=rows
-    )
+    return user_states[user_id]
 
 
 # ============================================================
-# START
+# HELPERS
 # ============================================================
 
-@dp.message(
-    CommandStart()
-)
-async def start(
-    message: Message,
-):
+def esc(
+    value,
+) -> str:
 
-    await storage.get_user(
-        message.from_user.id
+    if value is None:
+        return ""
+
+    return html.escape(
+        str(value)
     )
 
 
-    await message.answer(
-        "📱 <b>iPhone Finder</b>\n\n"
-        "Найду лучшие варианты iPhone "
-        "по твоему бюджету и параметрам.\n\n"
-        "ИИ сравнит объявления, "
-        "оценит риски и составит "
-        "тир-лист.",
-        reply_markup=main_keyboard(),
-        parse_mode="HTML",
+def money(
+    value: int | None,
+) -> str:
+
+    if value is None:
+        return "—"
+
+    return (
+        f"{value:,}"
+        .replace(",", " ")
+        + " ₽"
     )
 
 
-# ============================================================
-# NEW SEARCH
-# ============================================================
-
-@dp.callback_query(
-    F.data == "new_search"
-)
-async def new_search(
-    callback: CallbackQuery,
-):
-
-    user_states[
-        callback.from_user.id
-    ] = {
-        "filters":
-            SearchFilters()
-    }
-
-
-    await callback.message.edit_text(
-        "📱 <b>Выбери модель</b>\n\n"
-        "Можно выбрать несколько.",
-        reply_markup=models_keyboard(),
-        parse_mode="HTML",
-    )
-
-
-    await callback.answer()
-
-
-# ============================================================
-# MODEL
-# ============================================================
-
-@dp.callback_query(
-    F.data.startswith("model:")
-)
-async def select_model(
-    callback: CallbackQuery,
-):
-
-    state = user_states.get(
-        callback.from_user.id
-    )
-
-    if not state:
-        await callback.answer(
-            "Начни новый поиск"
-        )
-        return
-
-
-    model = callback.data[
-        len("model:")
-    ]
-
-
-    filters: SearchFilters = (
-        state["filters"]
-    )
-
-
-    if model not in filters.models:
-
-        filters.models.append(
-            model
-        )
-
-        await callback.answer(
-            f"Добавлено: {model}"
-        )
-
-    else:
-
-        filters.models.remove(
-            model
-        )
-
-        await callback.answer(
-            f"Убрано: {model}"
-        )
-
-
-# ============================================================
-# MODEL DONE
-# ============================================================
-
-@dp.callback_query(
-    F.data == "model_done"
-)
-async def model_done(
-    callback: CallbackQuery,
-):
-
-    state = user_states.get(
-        callback.from_user.id
-    )
-
-    if not state:
-        return
-
-
-    filters: SearchFilters = (
-        state["filters"]
-    )
-
-
-    if not filters.models:
-
-        await callback.answer(
-            "Выбери хотя бы одну модель",
-            show_alert=True,
-        )
-
-        return
-
-
-    await callback.message.edit_text(
-        "💰 <b>Выбери максимальный бюджет</b>",
-        reply_markup=budget_keyboard(),
-        parse_mode="HTML",
-    )
-
-
-    await callback.answer()
-
-
-# ============================================================
-# BUDGET
-# ============================================================
-
-@dp.callback_query(
-    F.data.startswith("budget:")
-)
-async def select_budget(
-    callback: CallbackQuery,
-):
-
-    state = user_states.get(
-        callback.from_user.id
-    )
-
-    if not state:
-        return
-
-
-    amount = int(
-        callback.data.split(":")[1]
-    )
-
-
-    filters: SearchFilters = (
-        state["filters"]
-    )
-
-    filters.max_price = amount
-
-
-    await callback.message.edit_text(
-        f"💰 Бюджет: <b>{amount:,} ₽</b>\n\n"
-        "Теперь можно настроить дополнительные фильтры.",
-        reply_markup=filters_keyboard(),
-        parse_mode="HTML",
-    )
-
-
-    await callback.answer()
-
-
-# ============================================================
-# CUSTOM BUDGET
-# ============================================================
-
-@dp.callback_query(
-    F.data == "budget_custom"
-)
-async def custom_budget(
-    callback: CallbackQuery,
-):
-
-    user_states[
-        callback.from_user.id
-    ]["awaiting_budget"] = True
-
-
-    await callback.message.edit_text(
-        "💰 Напиши максимальный бюджет одним числом.\n\n"
-        "Например:\n"
-        "<code>65000</code>",
-        parse_mode="HTML",
-    )
-
-
-    await callback.answer()
-
-
-@dp.message()
-async def text_handler(
-    message: Message,
-):
-
-    state = user_states.get(
-        message.from_user.id
-    )
-
-
-    if not state:
-        return
-
-
-    if state.get(
-        "awaiting_budget"
-    ):
-
-        try:
-
-            amount = int(
-                message.text
-                .replace(" ", "")
-                .replace("₽", "")
-            )
-
-            state[
-                "filters"
-            ].max_price = amount
-
-            state[
-                "awaiting_budget"
-            ] = False
-
-            await message.answer(
-                f"💰 Бюджет установлен: "
-                f"<b>{amount:,} ₽</b>",
-                reply_markup=filters_keyboard(),
-                parse_mode="HTML",
-            )
-
-        except ValueError:
-
-            await message.answer(
-                "Напиши только число.\n"
-                "Например: <code>65000</code>",
-                parse_mode="HTML",
-            )
-
-
-# ============================================================
-# FILTER STORAGE
-# ============================================================
-
-@dp.callback_query(
-    F.data == "filter_storage"
-)
-async def filter_storage(
-    callback: CallbackQuery,
-):
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-
-            [
-                InlineKeyboardButton(
-                    text="128 GB",
-                    callback_data="storage:128",
-                ),
-
-                InlineKeyboardButton(
-                    text="256 GB",
-                    callback_data="storage:256",
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="512 GB",
-                    callback_data="storage:512",
-                ),
-
-                InlineKeyboardButton(
-                    text="1 TB",
-                    callback_data="storage:1024",
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="filters",
-                )
-            ],
-
-        ]
-    )
-
-
-    await callback.message.edit_text(
-        "💾 <b>Память</b>\n\n"
-        "Можно выбрать несколько.",
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(
-    F.data.startswith("storage:")
-)
-async def select_storage(
-    callback: CallbackQuery,
-):
-
-    state = user_states.get(
-        callback.from_user.id
-    )
-
-    if not state:
-        return
-
-
-    value = int(
-        callback.data.split(":")[1]
-    )
-
-
-    filters = state["filters"]
-
-
-    if value in filters.storage:
-
-        filters.storage.remove(
-            value
-        )
-
-        await callback.answer(
-            "Убрано"
-        )
-
-    else:
-
-        filters.storage.append(
-            value
-        )
-
-        await callback.answer(
-            "Добавлено"
-        )
-
-
-# ============================================================
-# BATTERY
-# ============================================================
-
-@dp.callback_query(
-    F.data == "filter_battery"
-)
-async def filter_battery(
-    callback: CallbackQuery,
-):
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-
-            [
-                InlineKeyboardButton(
-                    text="80%+",
-                    callback_data="battery:80",
-                ),
-
-                InlineKeyboardButton(
-                    text="85%+",
-                    callback_data="battery:85",
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="90%+",
-                    callback_data="battery:90",
-                ),
-
-                InlineKeyboardButton(
-                    text="95%+",
-                    callback_data="battery:95",
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="Неважно",
-                    callback_data="battery:0",
-                )
-            ],
-
-        ]
-    )
-
-
-    await callback.message.edit_text(
-        "🔋 <b>Минимальный аккумулятор</b>",
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(
-    F.data.startswith("battery:")
-)
-async def select_battery(
-    callback: CallbackQuery,
-):
-
-    state = user_states.get(
-        callback.from_user.id
-    )
-
-    if not state:
-        return
-
-
-    value = int(
-        callback.data.split(":")[1]
-    )
-
-
-    state[
-        "filters"
-    ].min_battery = (
-        value
-        if value > 0
-        else None
-    )
-
-
-    await callback.message.edit_text(
-        "⚙️ <b>Фильтры</b>",
-        reply_markup=filters_keyboard(),
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# REPAIR
-# ============================================================
-
-@dp.callback_query(
-    F.data == "filter_repair"
-)
-async def filter_repair(
-    callback: CallbackQuery,
-):
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-
-            [
-                InlineKeyboardButton(
-                    text="Без ремонта",
-                    callback_data="repair:none",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="Можно с ремонтом",
-                    callback_data="repair:any",
-                )
-            ],
-
-        ]
-    )
-
-
-    await callback.message.edit_text(
-        "🔧 <b>Ремонт</b>",
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(
-    F.data.startswith("repair:")
-)
-async def select_repair(
-    callback: CallbackQuery,
-):
-
-    state = user_states.get(
-        callback.from_user.id
-    )
-
-    if not state:
-        return
-
-
-    state[
-        "filters"
-    ].repair_policy = (
-        callback.data.split(":")[1]
-    )
-
-
-    await callback.message.edit_text(
-        "⚙️ <b>Фильтры</b>",
-        reply_markup=filters_keyboard(),
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# CONDITION
-# ============================================================
-
-@dp.callback_query(
-    F.data == "filter_condition"
-)
-async def filter_condition(
-    callback: CallbackQuery,
-):
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-
-            [
-                InlineKeyboardButton(
-                    text="Как новый",
-                    callback_data="condition:new",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="Отличное",
-                    callback_data="condition:excellent",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="Хорошее",
-                    callback_data="condition:good",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="Любое",
-                    callback_data="condition:any",
-                )
-            ],
-
-        ]
-    )
-
-
-    await callback.message.edit_text(
-        "📱 <b>Состояние</b>",
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(
-    F.data.startswith("condition:")
-)
-async def select_condition(
-    callback: CallbackQuery,
-):
-
-    state = user_states.get(
-        callback.from_user.id
-    )
-
-    if not state:
-        return
-
-
-    value = callback.data.split(":")[1]
-
-
-    if value == "any":
-
-        state[
-            "filters"
-        ].conditions = []
-
-    else:
-
-        state[
-            "filters"
-        ].conditions = [
-            value
-        ]
-
-
-    await callback.message.edit_text(
-        "⚙️ <b>Фильтры</b>",
-        reply_markup=filters_keyboard(),
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# CITY
-# ============================================================
-
-@dp.callback_query(
-    F.data == "filter_city"
-)
-async def filter_city(
-    callback: CallbackQuery,
-):
-
-    user_states[
-        callback.from_user.id
-    ]["awaiting_city"] = True
-
-
-    await callback.message.edit_text(
-        "🏙 Напиши город.\n\n"
-        "Например: <code>Москва</code>",
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# FILTER MENU
-# ============================================================
-
-@dp.callback_query(
-    F.data == "filters"
-)
-async def filters(
-    callback: CallbackQuery,
-):
-
-    await callback.message.edit_text(
-        "⚙️ <b>Фильтры</b>\n\n"
-        "Настрой нужные параметры.",
-        reply_markup=filters_keyboard(),
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# START SEARCH
-# ============================================================
-
-@dp.callback_query(
-    F.data == "start_search"
-)
-async def start_search(
-    callback: CallbackQuery,
-):
-
-    state = user_states.get(
-        callback.from_user.id
-    )
-
-    if not state:
-        await callback.answer(
-            "Начни новый поиск"
-        )
-        return
-
-
-    filters: SearchFilters = (
-        state["filters"]
-    )
-
-
-    await callback.message.edit_text(
-        "🔎 <b>Ищу объявления...</b>\n\n"
-        "Это может занять некоторое время.",
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-    try:
-
-        listings = await avito.search(
-            filters
-        )
-
-
-        candidates =
-            prepare_candidates(
-                listings,
-                filters,
-            )
-
-
-        candidates = candidates[
-            :50
-        ]
-
-
-        if not candidates:
-
-            await callback.message.edit_text(
-                "😕 По заданным параметрам "
-                "ничего не найдено.\n\n"
-                "Попробуй увеличить бюджет "
-                "или ослабить фильтры."
-            )
-
-            return
-
-
-        await callback.message.edit_text(
-            "🤖 <b>ИИ анализирует "
-            f"{min(len(candidates), MAX_RESULTS)} "
-            "лучших вариантов...</b>",
-            parse_mode="HTML",
-        )
-
-
-        analyzed = []
-
-
-        for listing in candidates[
-            :MAX_RESULTS
-        ]:
-
-            analysis = await ai.analyze(
-                listing,
-                filters,
-            )
-
-            listing.raw[
-                "ai_analysis"
-            ] = analysis
-
-            analyzed.append(
-                listing
-            )
-
-
-        analyzed.sort(
-            key=lambda item:
-                int(
-                    item.raw
-                    .get(
-                        "ai_analysis",
-                        {}
-                    )
-                    .get(
-                        "score",
-                        0,
-                    )
-                ),
-            reverse=True,
-        )
-
-
-        state[
-            "results"
-        ] = analyzed
-
-
-        await storage.set_search(
-            callback.from_user.id,
-            {
-                "filters":
-                    asdict(filters),
-
-                "results": [
-                    {
-                        "id":
-                            x.id,
-
-                        "title":
-                            x.title,
-
-                        "price":
-                            x.price,
-
-                        "url":
-                            x.url,
-
-                        "score":
-                            x.raw
-                            .get(
-                                "ai_analysis",
-                                {}
-                            )
-                            .get(
-                                "score",
-                                0,
-                            ),
-                    }
-                    for x in analyzed
-                ],
-            },
-        )
-
-
-        text = build_results_text(
-            analyzed
-        )
-
-
-        await callback.message.edit_text(
-            text,
-            reply_markup=
-                results_keyboard(
-                    analyzed
-                ),
-            parse_mode="HTML",
-        )
-
-
-    except Exception as error:
-
-        print(
-            "Search error:",
-            error,
-        )
-
-        await callback.message.edit_text(
-            "❌ Произошла ошибка при поиске.\n\n"
-            f"<code>{str(error)[:500]}</code>",
-            parse_mode="HTML",
-        )
-
-
-# ============================================================
-# RESULTS
-# ============================================================
-
-def tier(score: int) -> str:
-
-    if score >= 90:
-        return "S"
-
-    if score >= 80:
-        return "A"
-
-    if score >= 70:
-        return "B"
-
-    if score >= 60:
-        return "C"
-
-    return "D"
-
-
-def verdict_text(
-    verdict: str,
+def verdict(
+    value: str,
 ) -> str:
 
     return {
@@ -1210,93 +137,1219 @@ def verdict_text(
         "AVOID":
             "🔴 НЕ БРАТЬ",
     }.get(
-        verdict,
-        "🟡 НУЖНА ПРОВЕРКА",
+        value,
+        "🟡 ПРОВЕРИТЬ",
     )
 
 
-def build_results_text(
+def tier_emoji(
+    tier: str,
+) -> str:
+
+    return {
+        "S": "🏆",
+        "A": "🥇",
+        "B": "🥈",
+        "C": "🥉",
+        "D": "⚠️",
+    }.get(
+        tier,
+        "📱",
+    )
+
+
+# ============================================================
+# MAIN KEYBOARD
+# ============================================================
+
+def main_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔎 Новый поиск",
+                    callback_data="search:new",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💾 Последний поиск",
+                    callback_data="search:last",
+                ),
+                InlineKeyboardButton(
+                    text="⭐ Избранное",
+                    callback_data="favorites",
+                ),
+            ],
+        ]
+    )
+
+
+# ============================================================
+# MODEL KEYBOARD
+# ============================================================
+
+MODELS = [
+    "iPhone 13",
+    "iPhone 13 Pro",
+    "iPhone 13 Pro Max",
+    "iPhone 14",
+    "iPhone 14 Pro",
+    "iPhone 14 Pro Max",
+    "iPhone 15",
+    "iPhone 15 Pro",
+    "iPhone 15 Pro Max",
+    "iPhone 16",
+    "iPhone 16 Plus",
+    "iPhone 16 Pro",
+    "iPhone 16 Pro Max",
+]
+
+
+def models_keyboard(
+    selected: list[str],
+):
+
+    rows = []
+
+    for i in range(
+        0,
+        len(MODELS),
+        2,
+    ):
+
+        row = []
+
+        for model in MODELS[i:i + 2]:
+
+            mark = (
+                "✅ "
+                if model in selected
+                else ""
+            )
+
+            row.append(
+                InlineKeyboardButton(
+                    text=mark + model,
+                    callback_data=(
+                        "model:"
+                        + model
+                    ),
+                )
+            )
+
+        rows.append(row)
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="➡️ Далее",
+                callback_data="models:done",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+# ============================================================
+# BUDGET
+# ============================================================
+
+def budget_keyboard():
+
+    values = [
+        30000,
+        40000,
+        50000,
+        60000,
+        70000,
+        100000,
+    ]
+
+    rows = []
+
+    for i in range(
+        0,
+        len(values),
+        2,
+    ):
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"до {money(values[i])}",
+                    callback_data=(
+                        f"budget:{values[i]}"
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text=f"до {money(values[i + 1])}",
+                    callback_data=(
+                        f"budget:{values[i + 1]}"
+                    ),
+                ),
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="💰 Ввести самому",
+                callback_data="budget:custom",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+# ============================================================
+# FILTERS
+# ============================================================
+
+def filters_keyboard(
+    filters: SearchFilters,
+):
+
+    storage = (
+        ", ".join(
+            str(x)
+            for x in filters.storage
+        )
+        if filters.storage
+        else "любая"
+    )
+
+    battery = (
+        f"{filters.min_battery}%+"
+        if filters.min_battery
+        else "любая"
+    )
+
+    repair = {
+        "any": "любой",
+        "none": "без ремонта",
+    }.get(
+        filters.repair_policy,
+        filters.repair_policy,
+    )
+
+    city = (
+        filters.city
+        if filters.city
+        else "любой"
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"💾 Память: {storage}",
+                    callback_data="filter:storage",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"🔋 АКБ: {battery}",
+                    callback_data="filter:battery",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"🔧 Ремонт: {repair}",
+                    callback_data="filter:repair",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"🏙 Город: {city}",
+                    callback_data="filter:city",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔎 НАЧАТЬ ПОИСК",
+                    callback_data="search:start",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="home",
+                )
+            ],
+        ]
+    )
+
+
+# ============================================================
+# START
+# ============================================================
+
+@dp.message(
+    CommandStart()
+)
+async def start(
+    message: Message,
+):
+
+    get_state(
+        message.from_user.id
+    )
+
+    await storage.get_user(
+        message.from_user.id
+    )
+
+    await message.answer(
+        "📱 <b>iPhone Finder</b>\n\n"
+        "Найду интересные iPhone "
+        "по твоему бюджету.\n\n"
+        "После поиска ИИ сравнит "
+        "объявления и составит "
+        "тир-лист.",
+        reply_markup=main_keyboard(),
+    )
+
+
+# ============================================================
+# HOME
+# ============================================================
+
+@dp.callback_query(
+    F.data == "home"
+)
+async def home(
+    callback: CallbackQuery,
+):
+
+    await callback.message.edit_text(
+        "📱 <b>iPhone Finder</b>\n\n"
+        "Что делаем?",
+        reply_markup=main_keyboard(),
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# NEW SEARCH
+# ============================================================
+
+@dp.callback_query(
+    F.data == "search:new"
+)
+async def new_search(
+    callback: CallbackQuery,
+):
+
+    user_states[
+        callback.from_user.id
+    ] = {
+        "filters": SearchFilters(),
+        "results": [],
+        "awaiting": None,
+    }
+
+    await callback.message.edit_text(
+        "📱 <b>Выбери iPhone</b>\n\n"
+        "Можно выбрать несколько моделей.",
+        reply_markup=models_keyboard([]),
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# MODEL
+# ============================================================
+
+@dp.callback_query(
+    F.data.startswith("model:")
+)
+async def model_select(
+    callback: CallbackQuery,
+):
+
+    state = get_state(
+        callback.from_user.id
+    )
+
+    model = callback.data[
+        len("model:")
+    ]
+
+    selected = (
+        state["filters"].models
+    )
+
+    if model in selected:
+
+        selected.remove(
+            model
+        )
+
+    else:
+
+        selected.append(
+            model
+        )
+
+    await callback.message.edit_reply_markup(
+        reply_markup=models_keyboard(
+            selected
+        )
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# MODELS DONE
+# ============================================================
+
+@dp.callback_query(
+    F.data == "models:done"
+)
+async def models_done(
+    callback: CallbackQuery,
+):
+
+    state = get_state(
+        callback.from_user.id
+    )
+
+    if not state["filters"].models:
+
+        await callback.answer(
+            "Выбери хотя бы одну модель.",
+            show_alert=True,
+        )
+
+        return
+
+    await callback.message.edit_text(
+        "💰 <b>Максимальный бюджет</b>",
+        reply_markup=budget_keyboard(),
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# BUDGET
+# ============================================================
+
+@dp.callback_query(
+    F.data.startswith("budget:")
+)
+async def budget_select(
+    callback: CallbackQuery,
+):
+
+    state = get_state(
+        callback.from_user.id
+    )
+
+    value = callback.data[
+        len("budget:")
+    ]
+
+    if value == "custom":
+
+        state["awaiting"] = (
+            "budget"
+        )
+
+        await callback.message.edit_text(
+            "💰 <b>Введи максимальный бюджет</b>\n\n"
+            "Например:\n"
+            "<code>65000</code>",
+        )
+
+        await callback.answer()
+
+        return
+
+    amount = int(value)
+
+    state[
+        "filters"
+    ].max_price = amount
+
+    await show_filters(
+        callback,
+        state["filters"],
+    )
+
+
+# ============================================================
+# FILTER MENU
+# ============================================================
+
+async def show_filters(
+    callback: CallbackQuery,
+    filters: SearchFilters,
+):
+
+    models = ", ".join(
+        filters.models
+    )
+
+    budget = money(
+        filters.max_price
+    )
+
+    text = (
+        "⚙️ <b>ПАРАМЕТРЫ ПОИСКА</b>\n\n"
+        f"📱 {esc(models)}\n"
+        f"💰 до {budget}\n\n"
+        "Настрой дополнительные фильтры."
+    )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=filters_keyboard(
+            filters
+        ),
+    )
+
+
+# ============================================================
+# STORAGE FILTER
+# ============================================================
+
+@dp.callback_query(
+    F.data == "filter:storage"
+)
+async def storage_menu(
+    callback: CallbackQuery,
+):
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="128 GB",
+                    callback_data="storage:128",
+                ),
+                InlineKeyboardButton(
+                    text="256 GB",
+                    callback_data="storage:256",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="512 GB",
+                    callback_data="storage:512",
+                ),
+                InlineKeyboardButton(
+                    text="1 TB",
+                    callback_data="storage:1024",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Сбросить",
+                    callback_data="storage:reset",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="filter:back",
+                )
+            ],
+        ]
+    )
+
+    await callback.message.edit_text(
+        "💾 <b>ПАМЯТЬ</b>\n\n"
+        "Можно выбрать несколько.",
+        reply_markup=keyboard,
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data.startswith("storage:")
+)
+async def storage_select(
+    callback: CallbackQuery,
+):
+
+    state = get_state(
+        callback.from_user.id
+    )
+
+    value = callback.data[
+        len("storage:")
+    ]
+
+    if value == "reset":
+
+        state[
+            "filters"
+        ].storage = []
+
+    else:
+
+        gb = int(value)
+
+        if gb in state[
+            "filters"
+        ].storage:
+
+            state[
+                "filters"
+            ].storage.remove(
+                gb
+            )
+
+        else:
+
+            state[
+                "filters"
+            ].storage.append(
+                gb
+            )
+
+    await callback.answer(
+        "Фильтр обновлён"
+    )
+
+
+# ============================================================
+# BATTERY
+# ============================================================
+
+@dp.callback_query(
+    F.data == "filter:battery"
+)
+async def battery_menu(
+    callback: CallbackQuery,
+):
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="80%+",
+                    callback_data="battery:80",
+                ),
+                InlineKeyboardButton(
+                    text="85%+",
+                    callback_data="battery:85",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="90%+",
+                    callback_data="battery:90",
+                ),
+                InlineKeyboardButton(
+                    text="95%+",
+                    callback_data="battery:95",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Неважно",
+                    callback_data="battery:reset",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="filter:back",
+                )
+            ],
+        ]
+    )
+
+    await callback.message.edit_text(
+        "🔋 <b>АККУМУЛЯТОР</b>\n\n"
+        "Выбери минимальный процент.",
+        reply_markup=keyboard,
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data.startswith("battery:")
+)
+async def battery_select(
+    callback: CallbackQuery,
+):
+
+    state = get_state(
+        callback.from_user.id
+    )
+
+    value = callback.data[
+        len("battery:")
+    ]
+
+    if value == "reset":
+
+        state[
+            "filters"
+        ].min_battery = None
+
+    else:
+
+        state[
+            "filters"
+        ].min_battery = int(
+            value
+        )
+
+    await callback.answer(
+        "Фильтр обновлён"
+    )
+
+
+# ============================================================
+# REPAIR
+# ============================================================
+
+@dp.callback_query(
+    F.data == "filter:repair"
+)
+async def repair_menu(
+    callback: CallbackQuery,
+):
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔧 Без ремонта",
+                    callback_data="repair:none",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Любой",
+                    callback_data="repair:any",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="filter:back",
+                )
+            ],
+        ]
+    )
+
+    await callback.message.edit_text(
+        "🔧 <b>РЕМОНТ</b>",
+        reply_markup=keyboard,
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data.startswith("repair:")
+)
+async def repair_select(
+    callback: CallbackQuery,
+):
+
+    state = get_state(
+        callback.from_user.id
+    )
+
+    state[
+        "filters"
+    ].repair_policy = (
+        callback.data.split(":")[1]
+    )
+
+    await callback.answer(
+        "Фильтр обновлён"
+    )
+
+
+# ============================================================
+# CITY
+# ============================================================
+
+@dp.callback_query(
+    F.data == "filter:city"
+)
+async def city_menu(
+    callback: CallbackQuery,
+):
+
+    state = get_state(
+        callback.from_user.id
+    )
+
+    state["awaiting"] = "city"
+
+    await callback.message.edit_text(
+        "🏙 <b>ГОРОД</b>\n\n"
+        "Напиши город.\n\n"
+        "Например:\n"
+        "<code>Москва</code>",
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# FILTER BACK
+# ============================================================
+
+@dp.callback_query(
+    F.data == "filter:back"
+)
+async def filter_back(
+    callback: CallbackQuery,
+):
+
+    state = get_state(
+        callback.from_user.id
+    )
+
+    await show_filters(
+        callback,
+        state["filters"],
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# TEXT INPUT
+# ============================================================
+
+@dp.message(
+    F.text
+)
+async def text_input(
+    message: Message,
+):
+
+    state = get_state(
+        message.from_user.id
+    )
+
+    awaiting = state.get(
+        "awaiting"
+    )
+
+    if awaiting == "budget":
+
+        raw = (
+            message.text
+            .replace(" ", "")
+            .replace("₽", "")
+        )
+
+        try:
+
+            amount = int(raw)
+
+            if amount <= 0:
+                raise ValueError
+
+        except ValueError:
+
+            await message.answer(
+                "❌ Введи бюджет числом.\n\n"
+                "Например: "
+                "<code>65000</code>"
+            )
+
+            return
+
+        state[
+            "filters"
+        ].max_price = amount
+
+        state["awaiting"] = None
+
+        await message.answer(
+            f"💰 Бюджет: "
+            f"<b>{money(amount)}</b>"
+        )
+
+        keyboard = filters_keyboard(
+            state["filters"]
+        )
+
+        await message.answer(
+            "⚙️ Теперь настрой фильтры.",
+            reply_markup=keyboard,
+        )
+
+        return
+
+    if awaiting == "city":
+
+        city = message.text.strip()
+
+        if len(city) < 2:
+
+            await message.answer(
+                "❌ Напиши нормальное название города."
+            )
+
+            return
+
+        state[
+            "filters"
+        ].city = city
+
+        state["awaiting"] = None
+
+        await message.answer(
+            f"🏙 Город: <b>{esc(city)}</b>",
+            reply_markup=filters_keyboard(
+                state["filters"]
+            ),
+        )
+
+
+# ============================================================
+# START SEARCH
+# ============================================================
+
+@dp.callback_query(
+    F.data == "search:start"
+)
+async def start_search(
+    callback: CallbackQuery,
+):
+
+    state = get_state(
+        callback.from_user.id
+    )
+
+    filters: SearchFilters = (
+        state["filters"]
+    )
+
+    if not filters.models:
+
+        await callback.answer(
+            "Не выбрана модель.",
+            show_alert=True,
+        )
+
+        return
+
+    if not filters.max_price:
+
+        await callback.answer(
+            "Не установлен бюджет.",
+            show_alert=True,
+        )
+
+        return
+
+    await callback.message.edit_text(
+        "🔎 <b>Ищу объявления...</b>\n\n"
+        "Сначала получаю варианты, "
+        "затем отбираю лучшие.",
+    )
+
+    await callback.answer()
+
+    try:
+
+        listings = await avito.search(
+            filters
+        )
+
+        if not listings:
+
+            await callback.message.edit_text(
+                "😕 <b>Ничего не найдено.</b>\n\n"
+                "Попробуй увеличить бюджет "
+                "или убрать часть фильтров.",
+                reply_markup=main_keyboard(),
+            )
+
+            return
+
+        candidates = prepare_candidates(
+            listings,
+            filters,
+        )
+
+        if not candidates:
+
+            await callback.message.edit_text(
+                "😕 Объявления получены, "
+                "но ни одно не прошло "
+                "твои фильтры.",
+                reply_markup=main_keyboard(),
+            )
+
+            return
+
+        candidates = candidates[
+            :MAX_RESULTS
+        ]
+
+        await callback.message.edit_text(
+            "🤖 <b>Анализирую варианты...</b>\n\n"
+            f"Проверяю: {len(candidates)}",
+        )
+
+        results = []
+
+        for number, listing in enumerate(
+            candidates,
+            start=1,
+        ):
+
+            try:
+
+                await callback.message.edit_text(
+                    "🤖 <b>Анализирую объявления...</b>\n\n"
+                    f"Объявление {number}/"
+                    f"{len(candidates)}",
+                )
+
+                await ai.analyze(
+                    listing,
+                    filters,
+                )
+
+                results.append(
+                    listing
+                )
+
+            except Exception as error:
+
+                print(
+                    "AI listing error:",
+                    error,
+                )
+
+        results = sort_by_ai(
+            results
+        )
+
+        state["results"] = results
+
+        await save_search(
+            callback.from_user.id,
+            filters,
+            results,
+        )
+
+        await callback.message.edit_text(
+            build_results(
+                results
+            ),
+            reply_markup=results_keyboard(
+                results
+            ),
+        )
+
+    except Exception as error:
+
+        print(
+            "SEARCH ERROR:",
+            error,
+        )
+
+        await callback.message.edit_text(
+            "❌ <b>Ошибка поиска</b>\n\n"
+            f"<code>{esc(str(error)[:800])}</code>\n\n"
+            "Проверь настройки источника "
+            "объявлений.",
+            reply_markup=main_keyboard(),
+        )
+
+
+# ============================================================
+# SAVE SEARCH
+# ============================================================
+
+async def save_search(
+    user_id: int,
+    filters: SearchFilters,
+    results: list[Listing],
+):
+
+    await storage.set_search(
+        user_id,
+        {
+            "filters":
+                filters.to_dict(),
+
+            "results": [
+                {
+                    "id":
+                        item.id,
+
+                    "title":
+                        item.title,
+
+                    "price":
+                        item.price,
+
+                    "url":
+                        item.url,
+
+                    "score":
+                        (
+                            item.ai_analysis.score
+                            if item.ai_analysis
+                            else 0
+                        ),
+                }
+                for item in results
+            ],
+        },
+    )
+
+
+# ============================================================
+# RESULTS KEYBOARD
+# ============================================================
+
+def results_keyboard(
+    listings: list[Listing],
+):
+
+    rows = []
+
+    for index, listing in enumerate(
+        listings
+    ):
+
+        analysis = (
+            listing.ai_analysis
+        )
+
+        score = (
+            analysis.score
+            if analysis
+            else 0
+        )
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=(
+                        f"{index + 1}️⃣ "
+                        f"{score}/100 • "
+                        f"{money(listing.price)}"
+                    ),
+                    callback_data=(
+                        f"listing:{index}"
+                    ),
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔎 Новый поиск",
+                callback_data="search:new",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+# ============================================================
+# RESULTS TEXT
+# ============================================================
+
+def build_results(
     listings: list[Listing],
 ) -> str:
 
+    if not listings:
+
+        return (
+            "😕 <b>Ничего не найдено.</b>"
+        )
+
     lines = [
-        "🔎 <b>РЕЗУЛЬТАТЫ ПОИСКА</b>",
+        "🏆 <b>ТОП ВАРИАНТОВ</b>",
         "",
-        f"Найдено: {len(listings)}",
+        f"Найдено: <b>{len(listings)}</b>",
         "",
     ]
 
-
     current_tier = None
-
 
     for index, listing in enumerate(
         listings,
         start=1,
     ):
 
-        analysis = listing.raw.get(
-            "ai_analysis",
-            {},
+        analysis = (
+            listing.ai_analysis
         )
 
+        if not analysis:
+            continue
 
-        score = int(
-            analysis.get(
-                "score",
-                0,
-            )
-        )
+        if analysis.tier != current_tier:
 
-
-        current = tier(score)
-
-
-        if current != current_tier:
-
-            current_tier = current
+            current_tier = analysis.tier
 
             lines.append(
-                f"<b>━━ {current} TIER ━━</b>"
+                f"{tier_emoji(current_tier)} "
+                f"<b>{current_tier} TIER</b>"
             )
 
+            lines.append("")
+
+        battery = (
+            f"{listing.battery_percent}%"
+            if listing.battery_percent
+            else "—"
+        )
 
         lines.extend(
             [
-                "",
                 f"<b>{index}. "
-                f"{escape(listing.title)}</b>",
+                f"{esc(listing.title)}</b>",
 
-                f"💰 {listing.price:,} ₽",
+                f"💰 {money(listing.price)}",
 
-                (
-                    f"🔋 "
-                    f"{listing.battery_percent}%"
-                    if listing.battery_percent
-                    else
-                    "🔋 АКБ: не указана"
+                f"🔋 {battery}",
+
+                f"🤖 "
+                f"<b>{analysis.score}/100</b>",
+
+                verdict(
+                    analysis.verdict
                 ),
 
-                f"🤖 <b>{score}/100</b>",
-
-                verdict_text(
-                    analysis.get(
-                        "verdict",
-                        "CAUTION",
-                    )
-                ),
+                "",
             ]
         )
 
-
-    lines.extend(
-        [
-            "",
-            "Нажми номер объявления "
-            "для подробностей.",
-        ]
+    lines.append(
+        "Нажми на вариант, чтобы "
+        "посмотреть подробности."
     )
-
 
     return "\n".join(lines)
 
@@ -1312,101 +1365,92 @@ async def listing_details(
     callback: CallbackQuery,
 ):
 
-    state = user_states.get(
+    state = get_state(
         callback.from_user.id
     )
 
+    try:
 
-    if not state:
+        index = int(
+            callback.data.split(":")[1]
+        )
+
+    except (
+        ValueError,
+        IndexError,
+    ):
 
         await callback.answer(
-            "Поиск устарел"
+            "Ошибка."
         )
 
         return
-
-
-    index = int(
-        callback.data.split(":")[1]
-    )
-
 
     results = state.get(
         "results",
-        []
+        [],
     )
 
-
-    if index >= len(results):
+    if index < 0 or index >= len(
+        results
+    ):
 
         await callback.answer(
-            "Объявление не найдено"
+            "Объявление уже недоступно."
         )
 
         return
 
-
     listing = results[index]
 
-
-    analysis = listing.raw.get(
-        "ai_analysis",
-        {},
+    analysis = (
+        listing.ai_analysis
     )
 
+    # ФОТО
+    if listing.photos:
 
-    # Фото
-
-    photos = listing.photos[:10]
-
-
-    if photos:
-
-        media_sent = False
-
-        try:
-
-            from aiogram.types import (
-                InputMediaPhoto
+        photos = [
+            InputMediaPhoto(
+                media=url
             )
+            for url in listing.photos[:10]
+            if isinstance(
+                url,
+                str,
+            )
+            and url.startswith(
+                "http"
+            )
+        ]
 
-            media = [
-                InputMediaPhoto(
-                    media=url
+        if photos:
+
+            try:
+
+                await callback.message.answer_media_group(
+                    photos
                 )
-                for url in photos
-            ]
 
-            await callback.message.answer_media_group(
-                media
-            )
+            except Exception as error:
 
-            media_sent = True
+                print(
+                    "PHOTO ERROR:",
+                    error,
+                )
 
-        except Exception as error:
-
-            print(
-                "Photo send error:",
-                error,
-            )
-
-
-    text = build_listing_text(
-        listing,
-        analysis,
+    text = build_listing_details(
+        listing
     )
-
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-
             [
                 InlineKeyboardButton(
-                    text="🔗 Открыть Avito",
+                    text="🔗 Открыть объявление",
                     url=listing.url,
                 )
             ],
-
             [
                 InlineKeyboardButton(
                     text="⭐ В избранное",
@@ -1415,72 +1459,65 @@ async def listing_details(
                     ),
                 )
             ],
-
             [
                 InlineKeyboardButton(
-                    text="⬅️ К результатам",
-                    callback_data="back_results",
+                    text="⬅️ Назад к результатам",
+                    callback_data="results:back",
                 )
             ],
-
         ]
     )
-
 
     await callback.message.answer(
         text,
         reply_markup=keyboard,
-        parse_mode="HTML",
         disable_web_page_preview=True,
     )
-
 
     await callback.answer()
 
 
 # ============================================================
-# DETAILS TEXT
+# LISTING DETAILS TEXT
 # ============================================================
 
-def build_listing_text(
+def build_listing_details(
     listing: Listing,
-    analysis: dict,
 ) -> str:
 
-    score = int(
-        analysis.get(
-            "score",
-            0,
-        )
+    analysis = (
+        listing.ai_analysis
+        or None
     )
 
-
     lines = [
-
-        f"📱 <b>{escape(listing.title)}</b>",
-
+        f"📱 <b>{esc(listing.title)}</b>",
         "",
-
-        f"🤖 <b>AI SCORE: {score}/100</b>",
-
-        verdict_text(
-            analysis.get(
-                "verdict",
-                "CAUTION",
-            )
-        ),
-
-        "",
-
-        "━━━━━━━━━━━━",
-
-        f"💰 Цена: <b>{listing.price:,} ₽</b>",
-
-        f"📱 Модель: "
-        f"{escape(listing.model)}",
-
     ]
 
+    if analysis:
+
+        lines.extend(
+            [
+                f"🤖 <b>AI SCORE: "
+                f"{analysis.score}/100</b>",
+
+                verdict(
+                    analysis.verdict
+                ),
+
+                "",
+                "━━━━━━━━━━━━",
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
+            f"💰 <b>{money(listing.price)}</b>",
+            f"📱 Модель: {esc(listing.model)}",
+        ]
+    )
 
     if listing.storage_gb:
 
@@ -1489,7 +1526,6 @@ def build_listing_text(
             f"{listing.storage_gb} GB"
         )
 
-
     if listing.battery_percent:
 
         lines.append(
@@ -1497,105 +1533,40 @@ def build_listing_text(
             f"{listing.battery_percent}%"
         )
 
+    if listing.condition:
+
+        lines.append(
+            f"📱 Состояние: "
+            f"{esc(listing.condition)}"
+        )
 
     if listing.color:
 
         lines.append(
             f"🎨 Цвет: "
-            f"{escape(listing.color)}"
+            f"{esc(listing.color)}"
         )
 
-
-    if listing.condition:
+    if listing.city:
 
         lines.append(
-            f"📱 Состояние: "
-            f"{escape(listing.condition)}"
+            f"🏙 Город: "
+            f"{esc(listing.city)}"
         )
 
+    if listing.seller_name:
 
-    lines.extend(
-        [
-            "",
-            "━━━━━━━━━━━━",
-            "",
-            "🤖 <b>ОЦЕНКА ИИ</b>",
-            "",
-            escape(
-                analysis.get(
-                    "summary",
-                    "",
-                )
-            ),
-        ]
-    )
-
-
-    advantages = analysis.get(
-        "advantages",
-        [],
-    )
-
-
-    if advantages:
-
-        lines.extend(
-            [
-                "",
-                "✅ <b>ПЛЮСЫ</b>",
-            ]
+        lines.append(
+            f"👤 Продавец: "
+            f"{esc(listing.seller_name)}"
         )
 
-        for item in advantages[:8]:
+    if listing.seller_rating:
 
-            lines.append(
-                f"• {escape(item)}"
-            )
-
-
-    risks = analysis.get(
-        "risks",
-        [],
-    )
-
-
-    if risks:
-
-        lines.extend(
-            [
-                "",
-                "⚠️ <b>РИСКИ</b>",
-            ]
+        lines.append(
+            f"⭐ Рейтинг: "
+            f"{listing.seller_rating}"
         )
-
-        for item in risks[:8]:
-
-            lines.append(
-                f"• {escape(item)}"
-            )
-
-
-    checks = analysis.get(
-        "checks",
-        [],
-    )
-
-
-    if checks:
-
-        lines.extend(
-            [
-                "",
-                "🔍 <b>ПРОВЕРИТЬ ПЕРЕД ПОКУПКОЙ</b>",
-            ]
-        )
-
-        for item in checks[:8]:
-
-            lines.append(
-                f"• {escape(item)}"
-            )
-
 
     if listing.repair_info:
 
@@ -1603,12 +1574,11 @@ def build_listing_text(
             [
                 "",
                 "🔧 <b>РЕМОНТ</b>",
-                escape(
+                esc(
                     listing.repair_info
                 ),
             ]
         )
-
 
     if listing.screen_info:
 
@@ -1616,45 +1586,167 @@ def build_listing_text(
             [
                 "",
                 "📺 <b>ЭКРАН</b>",
-                escape(
+                esc(
                     listing.screen_info
                 ),
             ]
         )
 
+    if listing.accessories:
+
+        lines.extend(
+            [
+                "",
+                "📦 <b>КОМПЛЕКТ</b>",
+                esc(
+                    ", ".join(
+                        listing.accessories
+                    )
+                ),
+            ]
+        )
+
+    if analysis:
+
+        lines.extend(
+            [
+                "",
+                "━━━━━━━━━━━━",
+                "",
+                "🤖 <b>АНАЛИЗ ИИ</b>",
+                "",
+                esc(
+                    analysis.summary
+                ),
+            ]
+        )
+
+        if analysis.advantages:
+
+            lines.extend(
+                [
+                    "",
+                    "✅ <b>ПЛЮСЫ</b>",
+                ]
+            )
+
+            for item in analysis.advantages:
+
+                lines.append(
+                    f"• {esc(item)}"
+                )
+
+        if analysis.risks:
+
+            lines.extend(
+                [
+                    "",
+                    "⚠️ <b>РИСКИ</b>",
+                ]
+            )
+
+            for item in analysis.risks:
+
+                lines.append(
+                    f"• {esc(item)}"
+                )
+
+        if analysis.checks:
+
+            lines.extend(
+                [
+                    "",
+                    "🔍 <b>ПРОВЕРИТЬ</b>",
+                ]
+            )
+
+            for item in analysis.checks:
+
+                lines.append(
+                    f"• {esc(item)}"
+                )
+
+        lines.extend(
+            [
+                "",
+                "📊 <b>ОЦЕНКИ</b>",
+                "",
+                f"Цена: "
+                f"{analysis.price_score}/10",
+
+                f"Состояние: "
+                f"{analysis.condition_score}/10",
+
+                f"АКБ: "
+                f"{analysis.battery_score}/10",
+
+                f"Ремонт: "
+                f"{analysis.repair_score}/10",
+
+                f"Продавец: "
+                f"{analysis.seller_score}/10",
+            ]
+        )
 
     if listing.description:
 
         description = (
             listing.description
-            .strip()
         )
 
-
-        if len(description) > 1200:
+        if len(description) > 1800:
 
             description = (
-                description[:1200]
+                description[:1800]
                 + "..."
             )
-
 
         lines.extend(
             [
                 "",
-                "📝 <b>ОПИСАНИЕ AVITO</b>",
-                escape(
-                    description
-                ),
+                "📝 <b>ОПИСАНИЕ ОБЪЯВЛЕНИЯ</b>",
+                "",
+                esc(description),
             ]
         )
-
 
     return "\n".join(lines)
 
 
 # ============================================================
-# FAVORITES
+# BACK RESULTS
+# ============================================================
+
+@dp.callback_query(
+    F.data == "results:back"
+)
+async def back_results(
+    callback: CallbackQuery,
+):
+
+    state = get_state(
+        callback.from_user.id
+    )
+
+    results = state.get(
+        "results",
+        [],
+    )
+
+    await callback.message.edit_text(
+        build_results(
+            results
+        ),
+        reply_markup=results_keyboard(
+            results
+        ),
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# FAVORITE
 # ============================================================
 
 @dp.callback_query(
@@ -1664,119 +1756,55 @@ async def favorite(
     callback: CallbackQuery,
 ):
 
-    state = user_states.get(
+    state = get_state(
         callback.from_user.id
     )
 
+    try:
 
-    if not state:
+        index = int(
+            callback.data.split(":")[1]
+        )
+
+    except (
+        ValueError,
+        IndexError,
+    ):
 
         await callback.answer(
-            "Поиск устарел"
+            "Ошибка."
         )
 
         return
-
-
-    index = int(
-        callback.data.split(":")[1]
-    )
-
 
     results = state.get(
         "results",
-        []
+        [],
     )
 
-
-    if index >= len(results):
+    if index < 0 or index >= len(
+        results
+    ):
 
         await callback.answer(
-            "Не найдено"
+            "Объявление не найдено."
         )
 
         return
 
-
     listing = results[index]
-
 
     await storage.add_favorite(
         callback.from_user.id,
-        {
-            "id":
-                listing.id,
-
-            "title":
-                listing.title,
-
-            "price":
-                listing.price,
-
-            "url":
-                listing.url,
-
-            "score":
-                listing.raw
-                .get(
-                    "ai_analysis",
-                    {}
-                )
-                .get(
-                    "score",
-                    0,
-                ),
-        },
+        listing.to_dict(
+            include_raw=False
+        ),
     )
-
 
     await callback.answer(
         "⭐ Добавлено в избранное",
         show_alert=True,
     )
-
-
-# ============================================================
-# BACK RESULTS
-# ============================================================
-
-@dp.callback_query(
-    F.data == "back_results"
-)
-async def back_results(
-    callback: CallbackQuery,
-):
-
-    state = user_states.get(
-        callback.from_user.id
-    )
-
-
-    if not state:
-
-        await callback.answer()
-        return
-
-
-    results = state.get(
-        "results",
-        []
-    )
-
-
-    await callback.message.answer(
-        build_results_text(
-            results
-        ),
-        reply_markup=
-            results_keyboard(
-                results
-            ),
-        parse_mode="HTML",
-    )
-
-
-    await callback.answer()
 
 
 # ============================================================
@@ -1794,142 +1822,186 @@ async def favorites(
         callback.from_user.id
     )
 
-
     if not items:
 
         await callback.message.edit_text(
             "⭐ <b>Избранное пусто</b>",
-            parse_mode="HTML",
+            reply_markup=main_keyboard(),
         )
 
         await callback.answer()
 
         return
-
 
     lines = [
         "⭐ <b>ИЗБРАННОЕ</b>",
         "",
     ]
 
-
     for index, item in enumerate(
         items,
         start=1,
     ):
 
-        lines.append(
-            f"{index}. "
-            f"<a href=\"{item['url']}\">"
-            f"{escape(item['title'])}"
-            f"</a>\n"
-            f"💰 {item['price']:,} ₽"
-            f" | 🤖 {item['score']}/100\n"
+        score = item.get(
+            "ai_analysis",
+            {},
         )
 
+        if isinstance(
+            score,
+            dict,
+        ):
+            score = score.get(
+                "score",
+                0,
+            )
+        else:
+            score = 0
+
+        title = esc(
+            item.get(
+                "title",
+                "iPhone",
+            )
+        )
+
+        price = money(
+            item.get(
+                "price",
+                0,
+            )
+        )
+
+        url = item.get(
+            "url",
+            "",
+        )
+
+        lines.append(
+            f"{index}. "
+            f"<a href=\"{esc(url)}\">"
+            f"{title}"
+            f"</a>\n"
+            f"💰 {price} "
+            f"🤖 {score}/100\n"
+        )
 
     await callback.message.edit_text(
         "\n".join(lines),
-        parse_mode="HTML",
+        reply_markup=main_keyboard(),
         disable_web_page_preview=True,
     )
-
 
     await callback.answer()
 
 
 # ============================================================
-# MY SEARCH
+# LAST SEARCH
 # ============================================================
 
 @dp.callback_query(
-    F.data == "my_search"
+    F.data == "search:last"
 )
-async def my_search(
+async def last_search(
     callback: CallbackQuery,
 ):
 
-    search = await storage.get_search(
+    data = await storage.get_search(
         callback.from_user.id
     )
 
-
-    if not search:
+    if not data:
 
         await callback.message.edit_text(
             "💾 <b>Поисков пока нет.</b>\n\n"
-            "Нажми «Новый поиск».",
+            "Создай новый поиск.",
             reply_markup=main_keyboard(),
-            parse_mode="HTML",
         )
 
         await callback.answer()
 
         return
 
-
-    filters = search.get(
-        "filters",
-        {}
-    )
-
-
-    models = ", ".join(
-        filters.get(
-            "models",
-            []
+    filters = SearchFilters.from_dict(
+        data.get(
+            "filters",
+            {},
         )
     )
 
-
-    budget = filters.get(
-        "max_price"
+    models = ", ".join(
+        filters.models
     )
-
 
     await callback.message.edit_text(
-        "💾 <b>Последний поиск</b>\n\n"
-        f"📱 {escape(models)}\n"
-        f"💰 до {budget:,} ₽\n\n"
+        "💾 <b>ПОСЛЕДНИЙ ПОИСК</b>\n\n"
+        f"📱 {esc(models)}\n"
+        f"💰 до {money(filters.max_price)}\n"
+        f"🔋 "
+        f"{filters.min_battery or 'любая'}\n"
+        f"🏙 "
+        f"{esc(filters.city or 'любой')}\n\n"
         "Нажми «Новый поиск», "
-        "если хочешь изменить параметры.",
+        "чтобы изменить параметры.",
         reply_markup=main_keyboard(),
-        parse_mode="HTML",
     )
-
 
     await callback.answer()
 
 
 # ============================================================
-# ESCAPE
+# ERROR HANDLER
 # ============================================================
 
-def escape(
-    text,
-) -> str:
+@dp.errors()
+async def global_error(
+    event,
+):
 
-    if text is None:
-        return ""
-
-    text = str(text)
-
-    return (
-        text
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
+    print(
+        "GLOBAL ERROR:",
+        event.exception,
     )
 
 
 # ============================================================
-# RUN
+# MAIN
 # ============================================================
 
 async def main():
 
     print(
+        "================================"
+    )
+
+    print(
         "iPhone Finder started"
+    )
+
+    print(
+        "Groq:",
+        "ON"
+        if os.getenv("GROQ_API_KEY")
+        else "OFF",
+    )
+
+    print(
+        "Gemini:",
+        "ON"
+        if os.getenv("GEMINI_API_KEY")
+        else "OFF",
+    )
+
+    print(
+        "Avito API:",
+        "ON"
+        if os.getenv("AVITO_API_URL")
+        else "OFF",
+    )
+
+    print(
+        "================================"
     )
 
     await dp.start_polling(
