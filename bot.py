@@ -4,6 +4,22 @@ import os
 import re
 from typing import Optional
 
+import sys
+import subprocess
+
+try:
+    import aiogram
+except ModuleNotFoundError:
+    print("📦 aiogram не найден. Устанавливаю...")
+    subprocess.check_call([
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        "aiogram==3.22.0",
+    ])
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
