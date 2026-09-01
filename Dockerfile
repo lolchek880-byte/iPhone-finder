@@ -6,11 +6,12 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
 
-COPY requirements.txt /app/requirements.txt
+COPY requirements.txt .
 
 RUN python -m pip install --upgrade pip \
-    && python -m pip install -r /app/requirements.txt
+    && python -m pip install --no-cache-dir -r requirements.txt \
+    && python -c "import aiogram; print('AIROGRAM OK:', aiogram.__version__)"
 
-COPY . /app
+COPY . .
 
 CMD ["python", "bot.py"]
